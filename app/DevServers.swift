@@ -7,7 +7,7 @@ import SwiftUI
 
 struct Server: Decodable, Identifiable, Hashable {
     let root: Int
-    let name, group, kind, cwd, cmd, mem, age: String
+    let name, group, kind, cwd, cmd, mem, age, started: String
     let ports: [Int]
     let cpu: Int
     let old, hot, web: Bool
@@ -49,8 +49,13 @@ enum Backend {
         ?? Bundle.main.path(forResource: "devservers", ofType: "py")
         ?? NSHomeDirectory() + "/.devservers/devservers.py"
 
-    static func run(_ args: [String]) async -> Data {
-        await withCheckedContinuation { cont in
+    static var stateDirectory: URL {
+        URL(fileURLWithPath: ProcessInfo.processInfo.environment["DEVSERVERS_HOME"]
+            ?? NSHomeDirectory() + "/.devservers")
+    }
+
+    static func run(_ args: [String]) async throws -> Data {
+        try await withCheckedThrowingContinuation { cont in
             DispatchQueue.global(qos: .userInitiated).async {
                 let p = Process()
                 p.executableURL = URL(fileURLWithPath: python)
@@ -60,14 +65,43 @@ enum Backend {
                 p.environment = env
                 let out = Pipe()
                 p.standardOutput = out
-                p.standardError = FileHandle.nullDevice
-                do { try p.run() } catch { cont.resume(returning: Data()); return }
-                let data = out.fileHandleForReading.readDataToEndOfFile()
-                p.waitUntilExit()
-                cont.resume(returning: data)
+                let errorURL = FileManager.default.temporaryDirectory
+                    .appendingPathComponent("devservers-" + UUID().uuidString + ".log")
+                do {
+                    guard FileManager.default.createFile(atPath: errorURL.path, contents: nil,
+                                                        attributes: [.posixPermissions: 0o600]) else {
+                        throw BackendFailure("No se pudo crear el archivo temporal de errores.")
+                    }
+                    defer { try? FileManager.default.removeItem(at: errorURL) }
+                    let errors = try FileHandle(forWritingTo: errorURL)
+                    defer { try? errors.close() }
+                    p.standardError = errors
+                    try p.run()
+                    let timeout = DispatchWorkItem { if p.isRunning { p.terminate() } }
+                    DispatchQueue.global().asyncAfter(deadline: .now() + 120, execute: timeout)
+                    defer { timeout.cancel() }
+                    let data = out.fileHandleForReading.readDataToEndOfFile()
+                    p.waitUntilExit()
+                    guard p.terminationStatus == 0 else {
+                        let message = try? JSONDecoder().decode(BackendMessage.self, from: data)
+                        let stderr = (try? String(contentsOf: errorURL, encoding: .utf8)) ?? ""
+                        throw BackendFailure(message?.message ?? (stderr.isEmpty
+                            ? "El backend no respondió. Intenta actualizar la lista."
+                            : String(stderr.prefix(500))))
+                    }
+                    cont.resume(returning: data)
+                } catch {
+                    cont.resume(throwing: error)
+                }
             }
         }
     }
+}
+
+struct BackendFailure: LocalizedError {
+    let message: String
+    init(_ message: String) { self.message = message }
+    var errorDescription: String? { message }
 }
 
 // MARK: - Store
@@ -76,6 +110,10 @@ enum Backend {
 final class Store: ObservableObject {
     @Published var state = State()
     @Published var loaded = false
+    @Published var error: String?
+    @Published var refreshError: String?
+    @Published var refreshing = false
+    private var generation = 0
     @Published var busy: Set<String> = []
     @Published var toast: String?
     private var timer: Timer?
@@ -89,34 +127,54 @@ final class Store: ObservableObject {
     }
 
     func refresh() {
+        guard !refreshing, busy.isEmpty else { return }
+        refreshing = true
+        let version = generation
         Task {
-            let data = await Backend.run(["json"])
-            if let s = try? JSONDecoder().decode(State.self, from: data) {
-                state = s
-                loaded = true
+            do {
+                let data = try await Backend.run(["json"])
+                let next = try JSONDecoder().decode(State.self, from: data)
+                if generation == version {
+                    state = next
+                    loaded = true
+                    refreshError = nil
+                }
+            } catch {
+                if generation == version { self.refreshError = error.localizedDescription }
             }
+            refreshing = false
+            if generation != version { refresh() }
         }
     }
 
     func perform(_ key: String, _ args: [String]) {
-        guard !busy.contains(key) else { return }
+        guard busy.isEmpty else { return }
+        generation += 1
         busy.insert(key)
         Task {
-            let data = await Backend.run(args)
-            busy.remove(key)
-            let lines = String(decoding: data, as: UTF8.self).split(separator: "\n")
-            if let last = lines.last,
-               let msg = try? JSONDecoder().decode(BackendMessage.self, from: Data(last.utf8)) {
-                show("\(msg.title): \(msg.message)")
+            do {
+                let data = try await Backend.run(args)
+                if let msg = try? JSONDecoder().decode(BackendMessage.self, from: data) {
+                    show("\(msg.title): \(msg.message)")
+                }
+                error = nil
+            } catch {
+                self.error = error.localizedDescription
             }
+            busy.remove(key)
             refresh()
         }
     }
 
-    func stop(_ s: Server) { perform("stop-\(s.root)", ["stop", String(s.root)]) }
+    func stop(_ s: Server) { perform("stop-\(s.root)", ["stop", String(s.root), s.started]) }
     func start(_ e: Stopped) { perform("start-\(e.id)", ["start", e.id]) }
     func forget(_ e: Stopped) { perform("forget-\(e.id)", ["forget", e.id]) }
-    func clean() { perform("clean", ["clean", "--yes"]) }
+    func clean(_ targets: [Server]) {
+        let pairs: [[Any]] = targets.map { [$0.root, $0.started] }
+        guard let data = try? JSONSerialization.data(withJSONObject: pairs),
+              let json = String(data: data, encoding: .utf8) else { return }
+        perform("clean", ["clean", "--yes", "--targets", json])
+    }
 
     private func show(_ text: String) {
         toast = text
@@ -168,7 +226,17 @@ struct ContentView: View {
             Divider()
             ScrollView {
                 VStack(alignment: .leading, spacing: 14) {
-                    if store.loaded && store.state.servers.isEmpty {
+                    if let error = store.error ?? store.refreshError {
+                        VStack(alignment: .leading, spacing: 6) {
+                            Label("No se pudo completar la operación", systemImage: "exclamationmark.triangle")
+                                .font(.callout.weight(.medium))
+                            Text(error).font(.caption).textSelection(.enabled)
+                            Button("Actualizar lista") { store.error = nil; store.refresh() }
+                        }
+                        .foregroundStyle(.red)
+                        .padding(8)
+                    }
+                    if store.loaded && store.error == nil && store.refreshError == nil && store.state.servers.isEmpty {
                         EmptyState()
                     }
                     ForEach(groups, id: \.0) { group, servers in
@@ -177,7 +245,7 @@ struct ContentView: View {
                         }
                     }
                     if !store.state.orphans.isEmpty {
-                        Section(title: "Procesos huérfanos", tint: .orange) {
+                        Section(title: "Posibles huérfanos", tint: .orange) {
                             ForEach(store.state.orphans) { OrphanRow(server: $0) }
                         }
                     }
@@ -222,6 +290,7 @@ struct Header: View {
 
     private var summary: String {
         let n = store.state.servers.count
+        if store.refreshError != nil { return store.loaded ? "No se pudo actualizar · datos anteriores" : "No se pudo cargar la lista" }
         guard store.loaded else { return "Cargando…" }
         guard n > 0 else { return "Nada en marcha" }
         return "\(n) \(n == 1 ? "activo" : "activos") · \(store.state.total_mem)"
@@ -318,7 +387,7 @@ struct ServerRow: View {
                     .font(.caption)
                     .monospacedDigit()
                 }
-                StopButton(busy: store.busy.contains("stop-\(server.root)"), help: "Detener") {
+                StopButton(busy: !store.busy.isEmpty, help: "Detener") {
                     store.stop(server)
                 }
             }
@@ -347,6 +416,7 @@ struct ServerMenu: View {
 struct OrphanRow: View {
     @EnvironmentObject var store: Store
     let server: Server
+    @SwiftUI.State private var confirming = false
 
     var body: some View {
         HoverRow { _ in
@@ -357,15 +427,21 @@ struct OrphanRow: View {
                         Text(server.name).font(.body.weight(.medium)).lineLimit(1)
                         Badge(text: server.kind)
                     }
-                    Text("Sin puerto · \(server.age) colgado")
+                    Text("Sin puerto · activo \(server.age)")
                         .font(.caption).foregroundStyle(.secondary).monospacedDigit()
                 }
                 Spacer(minLength: 8)
                 Text(server.mem).font(.caption).foregroundStyle(.secondary).monospacedDigit()
-                StopButton(busy: store.busy.contains("stop-\(server.root)"), help: "Matar proceso") {
-                    store.stop(server)
+                StopButton(busy: !store.busy.isEmpty, help: "Revisar y detener") {
+                    confirming = true
                 }
             }
+        }
+        .alert("¿Detener este proceso?", isPresented: $confirming) {
+            Button("Cancelar", role: .cancel) {}
+            Button("Detener", role: .destructive) { store.stop(server) }
+        } message: {
+            Text("Un proceso sin puerto puede ser una tarea válida.\n\n\(server.cmd)\n\(server.cwd)")
         }
         .contextMenu { Button("Copiar comando") { copy(server.cmd) } }
         .help(server.cmd)
@@ -394,7 +470,7 @@ struct StoppedRow: View {
                     IconButton(symbol: "xmark", help: "Quitar de la lista") { store.forget(entry) }
                 }
                 ActionButton(symbol: "play.fill", tint: .accentColor,
-                             busy: store.busy.contains("start-\(entry.id)"), help: "Relanzar") {
+                             busy: !store.busy.isEmpty, help: "Relanzar") {
                     store.start(entry)
                 }
             }
@@ -415,38 +491,29 @@ struct StoppedRow: View {
 struct Footer: View {
     @EnvironmentObject var store: Store
     @SwiftUI.State private var confirming = false
+    @SwiftUI.State private var targets: [Server] = []
 
     var body: some View {
         HStack(spacing: 10) {
             if let toast = store.toast {
                 Text(toast).font(.caption).foregroundStyle(.secondary).lineLimit(2)
-                    .transition(.opacity)
             } else if store.state.cleanable > 0 {
-                if confirming {
-                    Button("Detener \(store.state.cleanable)") {
-                        confirming = false
-                        store.clean()
-                    }
-                    .buttonStyle(.borderedProminent).tint(.red).controlSize(.small)
-                    Button("Cancelar") { confirming = false }.controlSize(.small)
-                } else {
-                    Button {
-                        confirming = true
-                        Task { try? await Task.sleep(for: .seconds(5)); confirming = false }
-                    } label: {
-                        Label("Limpiar viejos y huérfanos (\(store.state.cleanable))", systemImage: "sparkles")
-                    }
-                    .controlSize(.small)
-                    .disabled(store.busy.contains("clean"))
+                Button {
+                    targets = store.state.servers.filter { $0.old && $0.kind != "postgres" }
+                    confirming = true
+                } label: {
+                    Label("Revisar antiguos (\(store.state.cleanable))", systemImage: "clock")
                 }
+                .controlSize(.small)
+                .disabled(!store.busy.isEmpty || store.error != nil || store.refreshError != nil)
             } else {
-                Label("Nada viejo que limpiar", systemImage: "checkmark.circle")
+                Label("Sin servidores antiguos", systemImage: "checkmark.circle")
                     .font(.caption).foregroundStyle(.secondary)
             }
             Spacer()
             Menu {
                 Button("Abrir carpeta de logs") {
-                    NSWorkspace.shared.open(URL(fileURLWithPath: NSHomeDirectory() + "/.devservers"))
+                    NSWorkspace.shared.open(Backend.stateDirectory.appendingPathComponent("logs"))
                 }
                 Divider()
                 Button("Salir de Dev Servers") { NSApp.terminate(nil) }
@@ -456,6 +523,13 @@ struct Footer: View {
             .menuStyle(.borderlessButton)
             .menuIndicator(.hidden)
             .fixedSize()
+        }
+        .alert("¿Detener \(targets.count) servidores?", isPresented: $confirming) {
+            Button("Cancelar", role: .cancel) {}
+            Button("Detener", role: .destructive) { store.clean(targets) }
+        } message: {
+            Text(targets.map { "\($0.group) / \($0.name) \($0.portLabel)" }.joined(separator: "\n")
+                 + "\n\nLas bases de datos y los posibles huérfanos se revisan por separado.")
         }
         .animation(.easeOut(duration: 0.15), value: store.toast)
         .padding(.horizontal, 14)
@@ -493,6 +567,7 @@ struct IconButton: View {
         .buttonStyle(.borderless)
         .foregroundStyle(.secondary)
         .help(help)
+        .accessibilityLabel(help)
     }
 }
 
@@ -522,6 +597,7 @@ struct ActionButton: View {
         .disabled(busy)
         .onHover { hovering = $0 }
         .help(help)
+        .accessibilityLabel(help)
     }
 }
 

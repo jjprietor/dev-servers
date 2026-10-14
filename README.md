@@ -1,116 +1,122 @@
+<p align="center">
+  <img src="docs/icon.png" width="112" height="112" alt="Dev Servers icon">
+</p>
+
 # Dev Servers
 
-Una app nativa para la barra de menús de macOS que muestra todos los servidores de desarrollo que tienes corriendo (`next dev`, `vite`, `tsx watch`, postgres locales, `http.server`…) y te deja **detenerlos y relanzarlos con un click**.
+See what's running. Stop what you're done with. Restart it when you need it.
 
-Pensada para quien trabaja con muchos proyectos o *worktrees* a la vez y acaba con diez servers olvidados comiéndose la RAM, la batería y el swap.
+A small macOS menu bar app for local development servers. It groups processes by project and worktree, shows their ports, CPU and memory, and lets you stop a server together with its launcher and children.
 
-## Qué hace
+Native SwiftUI interface. Python standard library backend. No account, cloud service or telemetry.
 
-- **Ve todo lo que está escuchando** en un puerto TCP con tu usuario, agrupado por proyecto, con CPU, RAM y tiempo encendido.
-- **Detiene el server completo**: no solo el proceso que tiene el puerto, también el `npm`/`pnpm` que lo lanzó y todos sus hijos. Si no responde a `SIGTERM` en 5 s, usa `SIGKILL`. Los postgres se paran con `pg_ctl stop -m fast`, sin perder datos.
-- **Relanza con un click** lo que detuviste, con el mismo comando, la misma carpeta y las mismas variables de entorno (`PORT`, `DATABASE_URL`…).
-- **Avisa de lo que sobra**: marca en naranja los servers con más de 48 h encendidos y en rojo los que pasan del 100 % de CPU.
-- **Encuentra procesos huérfanos**: scripts de `node`/`tsx` que quedaron colgados sin puerto durante horas o días.
-- **Limpieza en un click** de todo lo viejo y huérfano, con confirmación.
+[Español](docs/README.es.md) · [Report a bug](https://github.com/jjprietor/dev-servers/issues)
 
-Ignora a propósito todo lo que vive en `/Applications`, `~/Library` y `/System` (Ollama, Docker Desktop, apps del sistema…), así que no puedes cerrar nada importante por error.
+## Install
 
-## Requisitos
-
-- macOS 14 (Sonoma) o superior
-- Xcode o las Command Line Tools (`xcode-select --install`), para compilar
-- `python3`; vale el que viene con las Command Line Tools
-
-## Instalación
+Requires **macOS 14 or later**, **Python 3.9 or later**, and the **Xcode Command Line Tools**. The app interface is currently in Spanish.
 
 ```sh
+# Install Apple's build tools if needed:
+xcode-select --install
+
 git clone https://github.com/jjprietor/dev-servers.git
 cd dev-servers
-./install.sh --login
+./install.sh
 ```
 
-Esto compila la app, la instala en `~/Applications/Dev Servers.app`, la abre y la añade a los ítems de inicio de sesión. Sin `--login` no se abre sola al iniciar sesión.
+The installer compiles for your Mac, installs `~/Applications/Dev Servers.app`, and opens it. Look for the server icon in the menu bar. To also launch at login, use `./install.sh --login`.
 
-Para actualizar: `git pull && ./install.sh`.
-
-## Uso
-
-Haz click en el icono de servidor de la barra de menús; el número que tiene al lado es la cantidad de servers activos.
-
-| Acción | Cómo |
-|---|---|
-| Detener un server | Botón rojo ⏹ de la fila |
-| Abrirlo en el navegador o ver su carpeta | Pasa el ratón por la fila |
-| Copiar el comando o el PID | Click derecho en la fila |
-| Relanzar uno detenido | Botón ▶︎ en *Detenidos recientemente* |
-| Limpiar viejos y huérfanos | Botón del pie del panel (pide confirmación) |
-
-El panel se actualiza cada 30 s y cada vez que lo abres.
-
-### Desde la terminal
-
-El backend también funciona como CLI:
+To update:
 
 ```sh
-./devservers.py list          # tabla de servers y huérfanos
-./devservers.py stop <pid>    # detiene un server y lo guarda para relanzar
-./devservers.py start <id>    # relanza uno detenido
-./devservers.py clean         # detiene viejos y huérfanos (pide confirmación)
-./devservers.py json          # estado completo en JSON
+git pull --ff-only
+./install.sh
 ```
 
-## Cómo funciona
+Building locally uses an ad hoc signature. The project does not currently provide an Apple-notarized download.
 
-```
-Dev Servers.app (SwiftUI, MenuBarExtra)
-        │  ejecuta y lee JSON
-        ▼
-devservers.py (Python, solo librería estándar)
-        │  ps · lsof · sysctl(KERN_PROCARGS2) · pg_ctl
-        ▼
-     tus procesos
-```
+## Use
 
-1. `lsof` lista los puertos en `LISTEN` de tu usuario.
-2. Desde cada proceso sube por el árbol mientras el padre sea un *launcher* (`npm`, `pnpm`, `node`, `tsx`, `bun`…). Así encuentra el proceso que realmente lanzaste.
-3. Para agruparlos usa la raíz del repo git de cada server (o los workspaces de [Conductor](https://conductor.build), si los usas).
-4. Al detener uno, lee su `argv`, su entorno y su carpeta exactos con `sysctl(KERN_PROCARGS2)` y los guarda para poder relanzarlo idéntico.
+| Action | Where |
+| --- | --- |
+| Stop a server | Stop button in its row |
+| Restart it | Play button under **Detenidos recientemente** |
+| Open a known web server or its folder | Hover over the row |
+| Copy command or PID | Right-click the row |
+| Review servers running for over 48 hours | **Revisar antiguos** in the footer |
+| Inspect a possible orphan | **Posibles huérfanos**; stopping requires confirmation |
+| Inspect restart output | **Ver log** on a stopped entry after a failed restart |
 
-## Privacidad
+The list refreshes when you open the panel and every 30 seconds. Orange means over 48 hours old; red means the process tree is using at least 100% CPU (approximately one core). Neither implies a server is safe to stop.
 
-Todo es local: no hay red ni telemetría. Para poder relanzar, las variables de entorno de cada server detenido se guardan en `~/.devservers/stopped.json` con permisos `600`. **Pueden incluir secretos** (claves de API, URLs de base de datos), así que no compartas ese archivo. Pulsa *Quitar de la lista* en un server detenido para borrarlo de ahí.
+## Stopping and restarting
 
-## Configuración
+- Detection covers TCP listeners owned by your user, excluding executables in common system and application directories. Review the command and folder before stopping an unfamiliar process.
+- Recognized launchers such as npm and pnpm are included when stopping a server. Ordinary Node and Python parent processes are not treated as launchers.
+- Ordinary servers receive `SIGTERM`, then `SIGKILL` after five seconds if needed. Process start times are checked before signalling to reduce the risk of acting on a reused PID.
+- PostgreSQL is stopped only through its matching `pg_ctl stop -m fast`. If its data directory cannot be determined or `pg_ctl` fails, the operation reports an error. It never falls back to a forced kill.
+- Bulk cleanup shows its target list and excludes PostgreSQL and possible orphans. A process without a listening port may be a valid worker or background job.
+- Restart uses the saved command, working directory and environment. It refuses to restart if a recorded port is already listening or the directory no longer exists.
 
-| Variable de entorno | Para qué |
-|---|---|
-| `DEVSERVERS_HOME` | Carpeta de estado (por defecto `~/.devservers`) |
-| `DEVSERVERS_PYTHON` | `python3` concreto que usará la app |
-| `DEVSERVERS_SCRIPT` | Usar otro `devservers.py` (útil para desarrollar) |
-
-Los umbrales están al principio de `devservers.py`: `OLD_HOURS` (48), `HOT_CPU` (100) y `ORPHAN_MIN_HOURS` (1).
-
-## Desinstalar
+## Command line
 
 ```sh
-./uninstall.sh           # quita la app y el ítem de inicio de sesión
-./uninstall.sh --purge   # además borra ~/.devservers
+./devservers.py list          # servers and possible orphans
+./devservers.py json          # state for the app; excludes saved environment values
+./devservers.py stop <pid>    # stop and save for restart
+./devservers.py start <id>    # restart a saved entry
+./devservers.py forget <id>   # remove a saved entry
+./devservers.py clean         # review and stop old servers; excludes PostgreSQL
 ```
 
-## Limitaciones
+CLI errors return a nonzero exit status. `clean --yes` skips confirmation; use it only when you intend to stop all eligible old servers.
 
-- Solo macOS.
-- Solo ve procesos de tu usuario; no puede gestionar servicios de `root` ni contenedores de Docker.
-- Al relanzar un server iniciado con `npm`/`pnpm`, se usa el comando visible del proceso (por ejemplo `npm run dev`). Los argumentos con comillas y espacios pueden perderse en ese caso.
+## Local data
 
-## Contribuir
+Restart information lives in `~/.devservers/stopped.json`. **It includes environment variables, which may contain API keys and database credentials.** State directories use mode `700`; history, lock files and restart logs use `600`. History writes are atomic, and mutations are serialized across app and CLI processes.
 
-Los issues y PRs son bienvenidos. La app está en `app/DevServers.swift` y el backend en `devservers.py`. Para probar cambios del backend sin recompilar:
+Removing an entry deletes its saved environment from the history. Logs remain until removed manually or with `./uninstall.sh --purge`; they can also contain sensitive application output. Do not attach your state directory to bug reports.
+
+## Configuration
+
+| Environment variable | Purpose |
+| --- | --- |
+| `DEVSERVERS_HOME` | State directory; defaults to `~/.devservers` |
+| `DEVSERVERS_PYTHON` | Python executable used by the app |
+| `DEVSERVERS_SCRIPT` | Alternative backend script, useful during development |
+
+GUI apps do not inherit your terminal's environment. To use overrides, launch the executable from that terminal. Age and CPU thresholds are constants near the top of `devservers.py`.
+
+## Limitations
+
+- macOS only; no root services or Docker container management.
+- Any eligible TCP listener can appear, including non-development services outside the excluded directories. There is no automatic proof that a process is disposable.
+- npm and other tools may rewrite their process titles. Reconstructed commands can lose quoting, and environment recovery can be incomplete. Restart is best effort.
+- A restart is reported after the process remains alive for two seconds. This is not an application health check.
+- The app does not manage logins, supervise restarted servers, rotate logs, or automatically update itself.
+
+## Development
 
 ```sh
-pkill -x DevServers; DEVSERVERS_SCRIPT="$PWD/devservers.py" "$HOME/Applications/Dev Servers.app/Contents/MacOS/DevServers"
+python3 -m unittest discover -s tests -v
+DEVSERVERS_INTEGRATION=1 python3 -m unittest discover -s tests -v
+./build.sh
 ```
 
-## Licencia
+The integration test starts a temporary HTTP server, discovers it, stops it, and verifies that restarting preserves its port, environment and working directory. It only targets its own fixture processes. CI runs tests and verifies a compiled app bundle on macOS.
+
+The UI is in `app/DevServers.swift`; discovery and lifecycle operations are in `devservers.py`. `build.sh` builds without installing or launching the app. See [CONTRIBUTING.md](CONTRIBUTING.md) for the development workflow.
+
+## Uninstall
+
+```sh
+./uninstall.sh           # remove app and login item; keep history and logs
+./uninstall.sh --purge   # also remove known state files and restart logs
+```
+
+Uninstalling does not stop your development servers.
+
+## License
 
 [MIT](LICENSE)

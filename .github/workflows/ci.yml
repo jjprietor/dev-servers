@@ -1,0 +1,29 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ['3.9', '3.13']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Backend tests and process round trip
+        run: python3 -m unittest discover -s tests -v
+        env:
+          DEVSERVERS_INTEGRATION: '1'
+      - name: Shell syntax
+        run: zsh -n build.sh install.sh uninstall.sh
+      - name: Build and verify app
+        run: ./build.sh

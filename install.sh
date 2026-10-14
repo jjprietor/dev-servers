@@ -1,35 +1,38 @@
 #!/bin/zsh
-# Compila Dev Servers.app y la instala en ~/Applications.
-#   ./install.sh          compila, instala y abre la app
-#   ./install.sh --login  además la añade a los ítems de inicio de sesión
+# Compile, install, and open Dev Servers. --login enables launch at login.
 set -euo pipefail
 cd "$(dirname "$0")"
+case "${1:-}" in
+  ''|--login) ;;
+  *) print -u2 'Usage: ./install.sh [--login]'; exit 1 ;;
+esac
+(( $# <= 1 )) || { print -u2 'Usage: ./install.sh [--login]'; exit 1; }
 
-APP_NAME="Dev Servers"
-DEST="$HOME/Applications/$APP_NAME.app"
-BUILD="build/$APP_NAME.app"
-
-command -v swiftc >/dev/null || { echo "Falta swiftc: instala Xcode o ejecuta 'xcode-select --install'." >&2; exit 1; }
-command -v python3 >/dev/null || { echo "Falta python3." >&2; exit 1; }
-
-echo "→ Compilando…"
-rm -rf build && mkdir -p "$BUILD/Contents/MacOS" "$BUILD/Contents/Resources"
-swiftc -O -parse-as-library -swift-version 5 -target "$(uname -m)-apple-macos14.0" \
-  -o "$BUILD/Contents/MacOS/DevServers" app/DevServers.swift
-cp devservers.py "$BUILD/Contents/Resources/devservers.py"
-cp app/Info.plist "$BUILD/Contents/Info.plist"
-codesign --force --sign - "$BUILD" >/dev/null 2>&1
-
-echo "→ Instalando en $DEST"
-pkill -x DevServers 2>/dev/null || true
+./build.sh
+DEST="$HOME/Applications/Dev Servers.app"
 mkdir -p "$HOME/Applications"
-rm -rf "$DEST" && cp -R "$BUILD" "$DEST"
-rm -rf build
-
-if [[ "${1:-}" == "--login" ]]; then
-  osascript -e "tell application \"System Events\" to make login item at end with properties {path:\"$DEST\", hidden:false}" >/dev/null
-  echo "→ Añadida a los ítems de inicio de sesión"
+STAGE="$(mktemp -d "$HOME/Applications/.devservers-install.XXXXXX")"
+trap 'rm -rf "$STAGE"' EXIT
+cp -R 'build/Dev Servers.app' "$STAGE/new.app"
+codesign --verify --deep --strict "$STAGE/new.app"
+pkill -x DevServers 2>/dev/null || true
+if [[ -d "$DEST" ]]; then
+  mv "$DEST" "$STAGE/previous.app"
+fi
+if ! mv "$STAGE/new.app" "$DEST"; then
+  [[ ! -d "$STAGE/previous.app" ]] || mv "$STAGE/previous.app" "$DEST"
+  exit 1
 fi
 
+if [[ "${1:-}" == --login ]]; then
+  osascript - "$DEST" <<'APPLESCRIPT'
+on run argv
+  tell application "System Events"
+    if exists login item "Dev Servers" then delete login item "Dev Servers"
+    make login item at end with properties {name:"Dev Servers", path:item 1 of argv, hidden:false}
+  end tell
+end run
+APPLESCRIPT
+fi
 open "$DEST"
-echo "✓ Listo. Busca el icono de servidor en la barra de menús."
+print 'Dev Servers installed. Look for the server icon in the menu bar.'

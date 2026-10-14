@@ -6,9 +6,10 @@
   devservers.py stop <pid>   detiene el server (y su árbol) y lo guarda para relanzar
   devservers.py start <id>   relanza un server detenido
   devservers.py forget <id>  lo quita de "detenidos"
-  devservers.py clean        detiene servers viejos (> OLD_HOURS) y procesos huérfanos
+  devservers.py clean        revisa y detiene servers viejos (> OLD_HOURS), salvo PostgreSQL
 """
 import ctypes
+import fcntl
 import json
 import os
 import re
@@ -17,6 +18,8 @@ import signal
 import struct
 import subprocess
 import sys
+import tempfile
+from contextlib import contextmanager
 import time
 import uuid
 from pathlib import Path
@@ -25,23 +28,20 @@ HOME = Path.home()
 STATE_DIR = Path(os.environ.get("DEVSERVERS_HOME", HOME / ".devservers"))
 STOPPED_FILE = STATE_DIR / "stopped.json"
 LOG_DIR = STATE_DIR / "logs"
-SELF = Path(__file__).resolve()
 
 OLD_HOURS = 48          # un server activo más tiempo que esto se marca como viejo
 HOT_CPU = 100.0         # % de CPU del árbol a partir del cual se marca en rojo
-ORPHAN_MIN_HOURS = 1    # antigüedad mínima para considerar huérfano a un proceso sin puerto
+ORPHAN_MIN_HOURS = 1    # antigüedad mínima para mostrar un posible huérfano
 MAX_STOPPED = 20
 
 # Ejecutables que lanzan o envuelven a un server; subimos por el árbol mientras el padre sea uno de estos.
-LAUNCHERS = {"node", "npm", "npx", "pnpm", "yarn", "bun", "bunx", "deno", "tsx", "turbo",
-             "nodemon", "python", "python3", "uv", "poetry", "railway", "dotenv"}
-# Procesos sin puerto que, colgados de launchd, consideramos huérfanos de desarrollo.
+LAUNCHERS = {"npm", "npx", "pnpm", "yarn", "bun", "bunx", "deno", "tsx", "turbo",
+             "nodemon", "uv", "poetry", "railway", "dotenv"}
+# Candidatos a huérfanos: la ausencia de puerto no demuestra que estén colgados.
 ORPHAN_EXES = {"node", "bun", "deno", "railway", "esbuild"}
 SYSTEM_PREFIXES = ("/System/", "/usr/libexec/", "/usr/sbin/", "/sbin/", "/Library/",
                    "/Applications/", str(HOME / "Applications") + "/", str(HOME / "Library") + "/")
 DEFAULT_PATH = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
-
-
 
 # ---------------------------------------------------------------- procesos
 
@@ -57,7 +57,7 @@ def _sysctl(mib, size):
     return buf.raw[:sz.value]
 
 
-_ARGMAX = struct.unpack("i", _sysctl([1, 8], 4))[0]  # CTL_KERN, KERN_ARGMAX
+_ARGMAX = struct.unpack("i", _sysctl([1, 8], 4) or struct.pack("i", 262144))[0]  # CTL_KERN, KERN_ARGMAX
 
 
 def procargs(pid):
@@ -93,11 +93,29 @@ def parse_etime(s):
     return (int(days) if days else 0) * 86400 + h * 3600 + m * 60 + sec
 
 
+class BackendError(Exception):
+    pass
+
+
 def run(cmd, timeout=10):
     try:
-        return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout).stdout
-    except (subprocess.SubprocessError, OSError):
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout,
+                                env={**os.environ, "LC_ALL": "C"})
+    except (subprocess.SubprocessError, OSError) as error:
+        raise BackendError(f"No se pudo ejecutar {cmd[0]}: {error}") from error
+    # lsof y ps -p devuelven 1 cuando no encuentran procesos.
+    no_matches = (cmd[0] == "lsof" or (cmd[0] == "ps" and "-p" in cmd))
+    if result.returncode and not (no_matches and result.returncode == 1
+                                  and not result.stdout.strip() and not result.stderr.strip()):
+        raise BackendError(f"{cmd[0]}: {result.stderr.strip() or 'no se pudo consultar el sistema'}")
+    return result.stdout
+
+
+def process_identity(pid):
+    fields = run(["ps", "-p", str(pid), "-o", "lstart=,stat="]).split()
+    if len(fields) < 6 or fields[-1].startswith("Z"):
         return ""
+    return " ".join(fields[:5])
 
 
 class Snapshot:
@@ -107,13 +125,13 @@ class Snapshot:
         self.uid = os.getuid()
         self.procs = {}
         self.children = {}
-        for line in run(["ps", "-axo", "pid=,ppid=,uid=,etime=,rss=,%cpu=,command="]).splitlines():
-            f = line.split(None, 6)
-            if len(f) < 7:
+        for line in run(["ps", "-axo", "pid=,ppid=,uid=,etime=,rss=,%cpu=,lstart=,command="]).splitlines():
+            f = line.split(None, 11)
+            if len(f) < 12:
                 continue
             pid, ppid, uid = int(f[0]), int(f[1]), int(f[2])
             self.procs[pid] = dict(pid=pid, ppid=ppid, uid=uid, age=parse_etime(f[3]),
-                                   rss=int(f[4]), cpu=float(f[5].replace(",", ".")), cmd=f[6])
+                                   rss=int(f[4]), cpu=float(f[5].replace(",", ".")), cmd=f[11], started=" ".join(f[6:11]))
             self.children.setdefault(ppid, []).append(pid)
         self.ports = {}
         out = run(["lsof", "-nP", "-a", "-u", str(self.uid), "-iTCP", "-sTCP:LISTEN", "-Fpn"])
@@ -163,7 +181,7 @@ class Snapshot:
         out, stack = [], [root]
         while stack:
             p = stack.pop()
-            if p in self.procs:
+            if p in self.procs and p not in out and self.procs[p]["uid"] == self.uid:
                 out.append(p)
                 stack.extend(self.children.get(p, []))
         return out
@@ -179,7 +197,16 @@ class Snapshot:
             # npm/pnpm aparecen como "node" o con el título reescrito
             pname = self.name(pp)
             ptitle = par["cmd"].split()[0] if par["cmd"] else ""
-            if pname not in LAUNCHERS and os.path.basename(ptitle) not in LAUNCHERS:
+            title = os.path.basename(ptitle)
+            args = self.args(pp)
+            # node is a runtime, not necessarily a launcher (editors and agents use it too).
+            node_launcher = (pname == "node" and args is not None and len(args[1]) > 1
+                             and os.path.basename(args[1][1]) in {
+                                 "npm-cli.js", "npx-cli.js", "pnpm.cjs", "pnpm.js", "yarn.js",
+                                 "turbo", "nodemon.js", "tsx"})
+            if pname not in LAUNCHERS and title not in LAUNCHERS and not node_launcher:
+                return pid
+            if self.is_system(pp):
                 return pid
             pid = pp
 
@@ -233,7 +260,7 @@ def describe(cwd, texts):
 
 def kind_of(cmd):
     c = cmd.lower()
-    for key, label in (("postgres", "postgres"), ("next", "next"), ("vite", "vite"), ("astro", "astro"),
+    for key, label in (("next", "next"), ("vite", "vite"), ("astro", "astro"),
                        ("http.server", "http"), ("railway", "railway"), ("tsx", "tsx"), ("uvicorn", "uvicorn"),
                        ("bun", "bun"), ("fake-supabase", "mock")):
         if key in c:
@@ -247,10 +274,6 @@ def fmt_age(s):
     if s >= 3600:
         return f"{s // 3600}h{(s % 3600) // 60:02d}"
     return f"{s // 60}m"
-
-
-def short_path(path):
-    return path.replace(str(HOME), "~").replace("/private/tmp", "/tmp")
 
 
 def fmt_mem(kb):
@@ -268,6 +291,8 @@ def collect():
         if pid not in snap.procs or snap.is_system(pid):
             continue
         root = snap.root_of(pid)
+        if snap.is_system(root) or root == me:
+            continue
         roots.setdefault(root, set()).update(snap.ports[pid])
     roots.pop(me, None)
 
@@ -290,7 +315,7 @@ def collect():
         cmd = snap.procs[root]["cmd"]
         texts = [snap.procs[p]["cmd"] for p in tree]
         group, name = describe(snap.cwd(root), texts)
-        return dict(root=root, tree=tree, ports=sorted(ports), cmd=cmd, kind=kind_of(" ".join(texts)),
+        return dict(root=root, started=snap.procs[root]["started"], tree=tree, ports=sorted(ports), cmd=cmd, kind="postgres" if snap.name(root) == "postgres" else kind_of(" ".join(texts)),
                     group=group, name=name, cwd=snap.cwd(root), age=snap.procs[root]["age"],
                     cpu=sum(snap.procs[p]["cpu"] for p in tree),
                     rss=sum(snap.procs[p]["rss"] for p in tree))
@@ -306,19 +331,58 @@ def is_old(s):
 
 # ---------------------------------------------------------------- estado de detenidos
 
+def private_dir(path):
+    path.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if path.is_symlink() or path.stat().st_uid != os.getuid():
+        raise BackendError(f"Carpeta de estado no válida: {path}")
+    path.chmod(0o700)
+
+
+@contextmanager
+def state_lock():
+    private_dir(STATE_DIR)
+    fd = os.open(STATE_DIR / "state.lock", os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, "w") as lock:
+        os.fchmod(lock.fileno(), 0o600)
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        yield
+
+
 def load_stopped():
     try:
-        return json.loads(STOPPED_FILE.read_text())
-    except (OSError, ValueError):
+        items = json.loads(STOPPED_FILE.read_text())
+    except FileNotFoundError:
         return []
+    except (OSError, ValueError) as error:
+        raise BackendError(f"No se pudo leer {STOPPED_FILE}. Conserva el archivo y revisa su contenido.") from error
+    fields = {"id": str, "name": str, "group": str, "kind": str, "cwd": str,
+              "argv": list, "env": dict, "ports": list, "stopped_at": int}
+    if not isinstance(items, list):
+        raise BackendError("El historial no contiene una lista válida.")
+    for item in items:
+        if (not isinstance(item, dict)
+                or any(not isinstance(item.get(k), t) for k, t in fields.items())
+                or not re.fullmatch(r"[a-f0-9]{8}", item["id"])
+                or not item["argv"] or not all(isinstance(a, str) and "\0" not in a for a in item["argv"])
+                or not all(isinstance(k, str) and isinstance(v, str) and "=" not in k
+                           and "\0" not in k + v for k, v in item["env"].items())
+                or not all(type(port) is int and 0 < port < 65536 for port in item["ports"])):
+            raise BackendError("El historial contiene una entrada no válida; no se ha modificado.")
+    return items
 
 
 def save_stopped(items):
-    STATE_DIR.mkdir(exist_ok=True)
-    tmp = STOPPED_FILE.with_suffix(".tmp")
-    tmp.write_text(json.dumps(items[:MAX_STOPPED], indent=1))
-    os.chmod(tmp, 0o600)  # guarda variables de entorno (pueden incluir secretos)
-    tmp.replace(STOPPED_FILE)
+    # El llamador mantiene state_lock durante toda la operación de lectura y escritura.
+    private_dir(STATE_DIR)
+    fd, name = tempfile.mkstemp(prefix=".stopped-", dir=STATE_DIR)
+    try:
+        with os.fdopen(fd, "w") as temp:
+            json.dump(items[:MAX_STOPPED], temp, indent=1)
+            temp.flush()
+            os.fsync(temp.fileno())
+        os.replace(name, STOPPED_FILE)
+    finally:
+        Path(name).unlink(missing_ok=True)
 
 
 def restart_spec(snap, s):
@@ -344,79 +408,100 @@ def restart_spec(snap, s):
 # ---------------------------------------------------------------- acciones
 
 def notify(title, msg):
-    if os.environ.get("DEVSERVERS_QUIET"):  # la app muestra el mensaje ella misma
+    if os.environ.get("DEVSERVERS_QUIET"):
         print(json.dumps({"title": title, "message": msg}))
-        return
-    script = f"display notification {json.dumps(msg)} with title {json.dumps(title)}"
-    subprocess.run(["osascript", "-e", script], capture_output=True)
+    else:
+        print(f"{title}: {msg}")
 
 
-def alive(pid):
-    try:
-        os.kill(pid, 0)
-        return True
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
+def same_process(pid, started):
+    return bool(started) and process_identity(pid) == started
 
 
-def kill_tree(pids, grace=5.0):
-    for p in reversed(pids):  # hijos primero
-        try:
-            os.kill(p, signal.SIGTERM)
-        except OSError:
-            pass
-    deadline = time.time() + grace
-    while time.time() < deadline and any(alive(p) for p in pids):
+def kill_tree(snap, pids, grace=5.0):
+    identities = {pid: snap.procs[pid]["started"] for pid in pids}
+
+    def send(pid, sig):
+        if same_process(pid, identities[pid]):
+            try:
+                os.kill(pid, sig)
+            except ProcessLookupError:
+                pass
+
+    for pid in reversed(pids):
+        send(pid, signal.SIGTERM)
+    deadline = time.monotonic() + grace
+    while time.monotonic() < deadline and any(same_process(p, identities[p]) for p in pids):
         time.sleep(0.2)
-    survivors = [p for p in pids if alive(p)]
-    for p in survivors:
-        try:
-            os.kill(p, signal.SIGKILL)
-        except OSError:
-            pass
-    return survivors
+    forced = [p for p in pids if same_process(p, identities[p])]
+    for pid in forced:
+        send(pid, signal.SIGKILL)
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline and any(same_process(p, identities[p]) for p in pids):
+        time.sleep(0.1)
+    if any(same_process(p, identities[p]) for p in pids):
+        raise BackendError("Algunos procesos siguen activos. Actualiza la lista antes de reintentar.")
+    return forced
 
 
 def stop_postgres(snap, s):
     a = snap.args(s["root"])
     if not a:
-        return False
-    exe, argv, _ = a
-    if "-D" not in argv:
-        return False
-    data = argv[argv.index("-D") + 1]
+        raise BackendError("No se pudo leer la configuración de PostgreSQL; no se ha detenido.")
+    exe, argv, env = a
+    data = env.get("PGDATA")
+    for index, arg in enumerate(argv):
+        if arg in ("-D", "--pgdata") and index + 1 < len(argv):
+            data = argv[index + 1]
+        elif arg.startswith("--pgdata="):
+            data = arg.split("=", 1)[1]
+        elif arg.startswith("-D") and len(arg) > 2:
+            data = arg[2:]
+    if not data:
+        raise BackendError("No se encontró PGDATA. Detén PostgreSQL con su gestor habitual.")
     if not os.path.isabs(data):
         data = os.path.join(s["cwd"], data)
     pg_ctl = os.path.join(os.path.dirname(exe), "pg_ctl")
-    r = subprocess.run([pg_ctl, "stop", "-D", data, "-m", "fast", "-w", "-t", "15"], capture_output=True)
-    return r.returncode == 0
+    run([pg_ctl, "stop", "-D", data, "-m", "fast", "-w", "-t", "15"], timeout=20)
 
 
 def do_stop(snap, s, record=True):
+    if not same_process(s["root"], s["started"]):
+        raise BackendError("El proceso cambió o ya terminó. Actualiza la lista.")
+    entry = None
     if record:
         spec = restart_spec(snap, s)
+        if not spec["argv"] or not spec["cwd"]:
+            raise BackendError("No se pudo guardar el comando para relanzarlo; no se ha detenido.")
         entry = dict(id=uuid.uuid4().hex[:8], group=s["group"], name=s["name"], kind=s["kind"],
                      ports=s["ports"], stopped_at=int(time.time()), **spec)
+        # Guarda antes de detener: un fallo de disco no debe dejar el server sin historial.
+        items = load_stopped()
         key = (entry["cwd"], entry["argv"])
-        rest = [e for e in load_stopped() if (e["cwd"], e["argv"]) != key]
-        save_stopped([entry] + rest)
-    if s["kind"] == "postgres" and stop_postgres(snap, s):
-        return []
-    return kill_tree(s["tree"])
+        save_stopped([entry] + [e for e in items if (e["cwd"], e["argv"]) != key])
+    try:
+        if snap.name(s["root"]) == "postgres":
+            stop_postgres(snap, s)
+            return []
+        return kill_tree(snap, s["tree"])
+    except (BackendError, OSError):
+        if entry and snap.name(s["root"]) == "postgres":
+            save_stopped(items)
+        raise
 
 
 def find_by_root(servers, pid):
     return next((s for s in servers if s["root"] == pid), None)
 
 
-def cmd_stop(pid):
+def cmd_stop(pid, expected=None):
     snap, servers, orphans = collect()
     s = find_by_root(servers + orphans, pid)
     if not s:
         notify("Dev Servers", f"El proceso {pid} ya no está activo.")
         return
+    if expected is not None and s["started"] != expected:
+        raise BackendError("El proceso cambió. Actualiza la lista antes de detenerlo.")
     forced = do_stop(snap, s, record=bool(s["ports"]))
     label = f"{s['name']}" + (f" :{s['ports'][0]}" if s["ports"] else "")
     notify("Detenido", label + (" (forzado con kill -9)" if forced else ""))
@@ -426,32 +511,30 @@ def cmd_start(entry_id):
     items = load_stopped()
     e = next((x for x in items if x["id"] == entry_id), None)
     if not e:
-        return
+        raise BackendError("El servidor ya no está en el historial.")
     snap = Snapshot()
     busy = [p for p in e["ports"] if any(p in ps for ps in snap.ports.values())]
     if busy:
-        notify("No se pudo relanzar", f"{e['name']}: el puerto {busy[0]} ya está en uso.")
-        return
+        raise BackendError(f"{e['name']}: el puerto {busy[0]} ya está en uso.")
     if not os.path.isdir(e["cwd"]):
-        notify("No se pudo relanzar", f"{e['name']}: la carpeta ya no existe.")
-        return
+        raise BackendError(f"{e['name']}: la carpeta ya no existe.")
     env = dict(e["env"]) or {"HOME": str(HOME)}
     env.setdefault("PATH", DEFAULT_PATH)
-    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    private_dir(LOG_DIR)
     log_path = LOG_DIR / f"{e['id']}.log"
-    with open(log_path, "ab") as log:
+    fd = os.open(log_path, os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, "ab") as log:
+        os.fchmod(log.fileno(), 0o600)
         log.write(f"\n=== {time.strftime('%F %T')} relanzado: {shlex.join(e['argv'])}\n".encode())
         log.flush()
         try:
             proc = subprocess.Popen(e["argv"], cwd=e["cwd"], env=env, stdin=subprocess.DEVNULL,
                                     stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
         except OSError as err:
-            notify("No se pudo relanzar", f"{e['name']}: {err}")
-            return
+            raise BackendError(f"{e['name']}: {err}") from err
     time.sleep(2)
     if proc.poll() is not None:
-        notify("Falló al arrancar", f"{e['name']}: revisa el log en ~/.devservers/logs/{e['id']}.log")
-        return
+        raise BackendError(f"{e['name']}: revisa el log en {log_path}")
     save_stopped([x for x in items if x["id"] != entry_id])
     notify("Relanzado", f"{e['name']}" + (f" :{e['ports'][0]}" if e["ports"] else ""))
 
@@ -462,23 +545,31 @@ def cmd_forget(entry_id):
 
 def confirm(text):
     script = (f"display dialog {json.dumps(text)} with title \"Dev Servers\" "
-              "buttons {\"Cancelar\", \"Limpiar\"} default button \"Limpiar\" cancel button \"Cancelar\"")
+              "buttons {\"Cancelar\", \"Limpiar\"} default button \"Cancelar\" cancel button \"Cancelar\"")
     return subprocess.run(["osascript", "-e", script], capture_output=True).returncode == 0
 
 
-def cmd_clean(ask=True):
-    snap, servers, orphans = collect()
-    targets = [s for s in servers if is_old(s)] + orphans
+def cmd_clean(ask=True, expected=None):
+    snap, servers, _ = collect()
+    # Las bases de datos y los posibles huérfanos requieren revisión individual.
+    targets = [s for s in servers if is_old(s) and snap.name(s["root"]) != "postgres"]
+    if expected is not None:
+        targets = [s for s in targets if [s["root"], s["started"]] in expected]
     if not targets:
         notify("Dev Servers", "Nada que limpiar.")
         return
-    lines = [f"• {s['name']} ({s['kind']}, {fmt_age(s['age'])})" for s in targets]
-    if ask and not confirm(f"Se detendrán {len(targets)} procesos:\n\n" + "\n".join(lines[:15])
-                           + ("\n…" if len(lines) > 15 else "")):
+    lines = [f"• {s['name']} :{s['ports'][0]} ({fmt_age(s['age'])})" for s in targets]
+    if ask and not confirm("Se detendrán estos servidores:\n\n" + "\n".join(lines)):
         return
+    failures = []
     for s in targets:
-        do_stop(snap, s, record=bool(s["ports"]))
-    notify("Limpieza hecha", f"{len(targets)} procesos detenidos.")
+        try:
+            do_stop(snap, s)
+        except (BackendError, OSError) as error:
+            failures.append(f"{s['name']}: {error}")
+    if failures:
+        raise BackendError("Algunos servidores no se detuvieron. " + "; ".join(failures))
+    notify("Limpieza hecha", f"{len(targets)} servidores detenidos.")
 
 
 # ---------------------------------------------------------------- salida
@@ -506,10 +597,10 @@ def render_json():
     _, servers, orphans = collect()
 
     def item(s):
-        return dict(root=s["root"], name=s["name"], group=s["group"], kind=s["kind"], ports=s["ports"],
+        return dict(root=s["root"], started=s["started"], name=s["name"], group=s["group"], kind=s["kind"], ports=s["ports"],
                     cpu=round(s["cpu"]), mem=fmt_mem_long(s["rss"]), age=fmt_age_long(s["age"]),
                     cwd=s["cwd"], cmd=s["cmd"], old=is_old(s), hot=s["cpu"] >= HOT_CPU,
-                    web=s["kind"] != "postgres" and bool(s["ports"]))
+                    web=s["kind"] in {"next", "vite", "astro", "http", "uvicorn"} and bool(s["ports"]))
 
     now = int(time.time())
     stopped = [dict(id=e["id"], name=e["name"], group=e["group"], kind=e["kind"], ports=e["ports"],
@@ -518,7 +609,7 @@ def render_json():
                for e in load_stopped()[:10]]
     print(json.dumps(dict(
         servers=[item(s) for s in servers], orphans=[item(s) for s in orphans], stopped=stopped,
-        cleanable=sum(is_old(s) for s in servers) + len(orphans),
+        cleanable=sum(is_old(s) and s["kind"] != "postgres" for s in servers),
         total_mem=fmt_mem_long(sum(s["rss"] for s in servers)),
         hot=any(s["cpu"] >= HOT_CPU for s in servers + orphans),
     )))
@@ -535,7 +626,7 @@ def render_list():
         flag = " 🔥" if s["cpu"] >= HOT_CPU else (" ⏳" if is_old(s) else "")
         print(f"  {s['root']:>6}  {server_line(s, width)}{flag}")
     if orphans:
-        print("\nHuérfanos sin puerto")
+        print("\nPosibles huérfanos sin puerto (revisar antes de detener)")
         for s in orphans:
             print(f"  {s['root']:>6}  {s['name'][:width]:<{width}} {fmt_age(s['age']):>7}  {s['cmd'][:80]}")
 
@@ -547,13 +638,14 @@ def main(argv):
     elif cmd == "list":
         render_list()
     elif cmd == "stop" and len(argv) > 2:
-        cmd_stop(int(argv[2]))
+        cmd_stop(int(argv[2]), argv[3] if len(argv) > 3 else None)
     elif cmd == "start" and len(argv) > 2:
         cmd_start(argv[2])
     elif cmd == "forget" and len(argv) > 2:
         cmd_forget(argv[2])
     elif cmd == "clean":
-        cmd_clean(ask="--yes" not in argv)
+        expected = json.loads(argv[argv.index("--targets") + 1]) if "--targets" in argv else None
+        cmd_clean(ask="--yes" not in argv, expected=expected)
     else:
         print(__doc__)
         return 1
@@ -561,4 +653,18 @@ def main(argv):
 
 
 if __name__ == "__main__":
-    sys.exit(main(sys.argv))
+    try:
+        if sys.platform != "darwin":
+            raise BackendError("Dev Servers requiere macOS.")
+        if len(sys.argv) > 1 and sys.argv[1] in {"stop", "start", "forget", "clean"}:
+            with state_lock():
+                result = main(sys.argv)
+        else:
+            result = main(sys.argv)
+    except (BackendError, OSError, ValueError, IndexError) as error:
+        if os.environ.get("DEVSERVERS_QUIET"):
+            print(json.dumps({"title": "No se pudo completar la operación", "message": str(error)}))
+        else:
+            print(f"Error: {error}", file=sys.stderr)
+        result = 1
+    sys.exit(result)
