@@ -9,6 +9,8 @@ import subprocess
 import sys
 import tempfile
 import unittest
+
+import devservers as app
 from urllib.request import urlopen
 
 SCRIPT = Path(__file__).resolve().parents[1] / 'devservers.py'
@@ -67,7 +69,15 @@ class RoundTripTests(unittest.TestCase):
                     self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                     return json.loads(result.stdout)
                 state = cli('json')
-                server = next(s for s in state['servers'] if s['root'] == proc.pid)
+                server = next((s for s in state['servers'] if s['root'] == proc.pid), None)
+                if server is None:
+                    snapshot = app.Snapshot()
+                    self.fail('Fixture not discovered: ' + json.dumps({
+                        'python': sys.executable, 'exe': snapshot.exe(proc.pid),
+                        'system': snapshot.is_system(proc.pid),
+                        'root': snapshot.root_of(proc.pid), 'pid': proc.pid,
+                        'ports': sorted(snapshot.ports.get(proc.pid, [])),
+                    }))
                 self.assertIn(port, server['ports'])
                 cli('stop', str(proc.pid), server['started'])
                 proc.wait(timeout=5)
