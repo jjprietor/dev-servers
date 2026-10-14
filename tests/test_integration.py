@@ -14,6 +14,7 @@ from urllib.request import urlopen
 SCRIPT = Path(__file__).resolve().parents[1] / 'devservers.py'
 SERVER = '''
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from socketserver import TCPServer
 import os
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
@@ -21,7 +22,13 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write((os.environ['ROUNDTRIP_MARKER'] + '|' + os.getcwd()).encode())
     def log_message(self, *args): pass
-server = HTTPServer(('127.0.0.1', int(os.environ.get('ROUNDTRIP_PORT', '0'))), Handler)
+class LocalServer(HTTPServer):
+    def server_bind(self):
+        # HTTPServer normally performs a reverse DNS lookup, which this test does not need.
+        TCPServer.server_bind(self)
+        self.server_name = 'localhost'
+        self.server_port = self.socket.getsockname()[1]
+server = LocalServer(('127.0.0.1', int(os.environ.get('ROUNDTRIP_PORT', '0'))), Handler)
 os.environ['ROUNDTRIP_PORT'] = str(server.server_port)
 print(server.server_port, flush=True)
 server.serve_forever()
@@ -45,8 +52,15 @@ class RoundTripTests(unittest.TestCase):
                                     start_new_session=True, text=True)
             restarted = None
             try:
-                self.assertTrue(select.select([proc.stdout], [], [], 10)[0], 'server did not start')
-                port = int(proc.stdout.readline())
+                if not select.select([proc.stdout], [], [], 30)[0]:
+                    proc.terminate()
+                    _, errors = proc.communicate(timeout=5)
+                    self.fail('server startup timed out: ' + errors)
+                line = proc.stdout.readline()
+                if not line:
+                    _, errors = proc.communicate(timeout=5)
+                    self.fail('server exited before startup: ' + errors)
+                port = int(line)
                 def cli(*args):
                     result = subprocess.run([sys.executable, str(SCRIPT), *args], env=env,
                                             capture_output=True, text=True, timeout=40)
