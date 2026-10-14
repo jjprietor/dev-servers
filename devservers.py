@@ -212,7 +212,12 @@ class Snapshot:
 
     def is_system(self, pid):
         """Apps instaladas y binarios del sistema (Ollama, Conductor, ControlCenter…) no se tocan."""
-        return self.exe(pid).startswith(SYSTEM_PREFIXES)
+        exe = self.exe(pid)
+        # python.org instala su intérprete en /Library; no es un servicio del sistema.
+        if re.fullmatch(r"/Library/Frameworks/Python\.framework/Versions/[^/]+/"
+                        r"(?:bin/python[0-9.]*|Resources/Python\.app/Contents/MacOS/Python)", exe):
+            return False
+        return exe.startswith(SYSTEM_PREFIXES)
 
 
 def launchd_pids():

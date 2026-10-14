@@ -200,6 +200,19 @@ class ProcessTests(unittest.TestCase):
         snap = self.snapshot('/Applications/Editor.app/node', ['npm', 'run', 'dev'])
         self.assertEqual(snap.root_of(20), 20)
 
+    def test_python_org_interpreter_is_not_excluded_as_a_system_service(self):
+        for exe in [
+            '/Library/Frameworks/Python.framework/Versions/3.13/bin/python3',
+            '/Library/Frameworks/Python.framework/Versions/3.13/Resources/Python.app/Contents/MacOS/Python',
+        ]:
+            with self.subTest(exe=exe):
+                snap = self.snapshot(exe, [exe, '-m', 'http.server'])
+                self.assertFalse(snap.is_system(10))
+
+    def test_other_library_applications_remain_excluded(self):
+        snap = self.snapshot('/Library/Other.app/Python', ['Python', 'background.py'])
+        self.assertTrue(snap.is_system(10))
+
     def test_subprocess_timeout_is_reported(self):
         with patch.object(app.subprocess, 'run', side_effect=subprocess.TimeoutExpired('ps', 10)):
             with self.assertRaises(app.BackendError):
